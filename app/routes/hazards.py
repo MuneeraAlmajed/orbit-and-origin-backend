@@ -1,4 +1,4 @@
-
+from typing import Optional
 from math import asin, cos, radians, sin, sqrt
 
 from fastapi import APIRouter, HTTPException, Query
@@ -56,8 +56,8 @@ def format_hazard(hazard):
 
 @router.get("")
 def get_hazards(
-    severity: str | None = None,
-    type: str | None = None
+    severity: Optional[str] = None,
+   type: Optional[str] = None,
 ):
     filtered = hazards
 

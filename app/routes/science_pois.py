@@ -1,4 +1,4 @@
-
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.data.mock_data import science_pois
@@ -27,8 +27,8 @@ def format_poi(poi):
 
 @router.get("")
 def get_science_pois(
-    type: str | None = None,
-    importance: str | None = None
+    type: Optional[str] = None,
+    importance: Optional[str] = None,
 ):
     filtered = science_pois
 
