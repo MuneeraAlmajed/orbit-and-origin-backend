@@ -60,11 +60,22 @@ def get_mars_terrain(lat: float, lon: float):
     try:
         mola_elevation = get_elevation(lat, lon)
         mola_slope = get_slope(lat, lon)
-        hirise_elevation = get_hirise_elevation(lat, lon)
-        hirise_slope = get_hirise_slope(lat, lon)
-
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
+
+    hirise_elevation = None
+    hirise_slope = None
+    hirise_errors = []
+
+    try:
+        hirise_elevation = get_hirise_elevation(lat, lon)
+    except ValueError as error:
+        hirise_errors.append(str(error))
+
+    try:
+        hirise_slope = get_hirise_slope(lat, lon)
+    except ValueError as error:
+        hirise_errors.append(str(error))
 
     return {
         "location": {
@@ -92,9 +103,10 @@ def get_mars_terrain(lat: float, lon: float):
                 "mola": "Derived from NASA MOLA MEGDR",
                 "hirise": "Derived from USGS/NASA HiRISE DTM"
             }
-        }
+        },
+        "hirise_status": "available" if not hirise_errors else "unavailable",
+        "hirise_message": hirise_errors
     }
-    
     
 @router.get("/terrain/grid")
 def get_terrain_grid():
@@ -103,10 +115,10 @@ def get_terrain_grid():
     south = 18.3067994
     north = 18.669315
     west = 77.2229331
-    east = 77.583964
+    east = 77.85
 
     rows = 20
-    columns = 20
+    columns = 35
 
     lat_step = (north - south) / rows
     lon_step = (east - west) / columns
@@ -119,28 +131,39 @@ def get_terrain_grid():
             lat = cell_south + lat_step / 2
             lon = cell_west + lon_step / 2
 
+            elevation = None
+            slope = None
+            source = None
+
             try:
                 elevation = get_hirise_elevation(lat, lon)
                 slope = get_hirise_slope(lat, lon)
-
-                cells.append({
-                    "bounds": [
-                        [cell_south, cell_west],
-                        [cell_south + lat_step, cell_west + lon_step]
-                    ],
-                    "elevation": elevation,
-                    "slope": slope
-                })
+                source = "USGS/NASA HiRISE DTM"
 
             except ValueError:
-                continue
+                try:
+                    elevation = get_elevation(lat, lon)
+                    slope = get_slope(lat, lon)
+                    source = "NASA MOLA MEGDR"
+
+                except ValueError:
+                    pass
+
+            cells.append({
+                "bounds": [
+                    [cell_south, cell_west],
+                    [cell_south + lat_step, cell_west + lon_step]
+                ],
+                "elevation": elevation,
+                "slope": slope,
+                "data_source": source
+            })
 
     return {
         "total_cells": len(cells),
         "data": cells,
-        "data_source": "USGS/NASA HiRISE DTM"
+        "data_source": "NASA MOLA MEGDR and USGS/NASA HiRISE DTM"
     }
-
 
 @router.get("/layers")
 def get_mars_layers():
