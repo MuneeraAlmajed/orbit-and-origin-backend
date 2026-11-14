@@ -94,6 +94,52 @@ def get_mars_terrain(lat: float, lon: float):
             }
         }
     }
+    
+    
+@router.get("/terrain/grid")
+def get_terrain_grid():
+    cells = []
+
+    south = 18.3067994
+    north = 18.669315
+    west = 77.2229331
+    east = 77.583964
+
+    rows = 20
+    columns = 20
+
+    lat_step = (north - south) / rows
+    lon_step = (east - west) / columns
+
+    for row in range(rows):
+        for col in range(columns):
+            cell_south = south + row * lat_step
+            cell_west = west + col * lon_step
+
+            lat = cell_south + lat_step / 2
+            lon = cell_west + lon_step / 2
+
+            try:
+                elevation = get_hirise_elevation(lat, lon)
+                slope = get_hirise_slope(lat, lon)
+
+                cells.append({
+                    "bounds": [
+                        [cell_south, cell_west],
+                        [cell_south + lat_step, cell_west + lon_step]
+                    ],
+                    "elevation": elevation,
+                    "slope": slope
+                })
+
+            except ValueError:
+                continue
+
+    return {
+        "total_cells": len(cells),
+        "data": cells,
+        "data_source": "USGS/NASA HiRISE DTM"
+    }
 
 
 @router.get("/layers")
