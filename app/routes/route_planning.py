@@ -3,13 +3,18 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from math import radians, sin, cos, asin, sqrt
 from itertools import count
+from functools import lru_cache
 
-from app.data.mock_data import hazards, terrain_layers, routes
+from app.data.mock_data import routes
+from app.routes.mars import get_terrain_grid
+from app.routes.hazards import get_terrain_risks
 
 router = APIRouter(prefix="/api/v1/routes", tags=["Route Planning & Safety"])
 
 MARS_RADIUS = 3389.5
 ROVER_SPEED = 4.0
+TERRAIN_SOURCE = "USGS/NASA HiRISE DTM and derived slope risks"
+
 
 saved_routes = {r["id"]: r.copy() for r in routes}
 next_id = count(max(saved_routes, default=0) + 1)
@@ -27,6 +32,16 @@ class RouteInput(BaseModel):
 
 class AnalysisInput(RouteInput):
     waypoints: list[Coordinate] = Field(min_length=2)
+
+
+@lru_cache(maxsize=1)
+def get_terrain_cells():
+    return get_terrain_grid()["data"]
+
+
+@lru_cache(maxsize=1)
+def get_terrain_risk_data():
+    return get_terrain_risks()["hazards"]
 
 
 def distance(a, b):
@@ -58,6 +73,32 @@ def interpolate(a, b, fraction):
     }
 
 
+def get_nearest_terrain_cell(point, cells):
+    nearest = None
+    shortest_distance = float("inf")
+
+    for cell in cells:
+        south_west = cell["bounds"][0]
+        north_east = cell["bounds"][1]
+
+        center_lat = (south_west[0] + north_east[0]) / 2
+        center_lon = (south_west[1] + north_east[1]) / 2
+
+        current_distance = distance(
+            point,
+            {"lat": center_lat, "lon": center_lon}
+        )
+
+        if current_distance < shortest_distance:
+            shortest_distance = current_distance
+            nearest = cell
+
+    if shortest_distance > 1.5:
+        return None
+
+    return nearest
+
+
 def hazard_distance(point, a, b):
     scale_y = MARS_RADIUS * 3.141592653589793 / 180
     scale_x = scale_y * cos(radians(point["lat"]))
@@ -85,19 +126,19 @@ def hazard_distance(point, a, b):
 
 def find_hazards(points):
     detected = []
+    detected_ids = set()
+    terrain_risks = get_terrain_risk_data()
 
-    for hazard in hazards:
-        location = {
-            "lat": hazard["lat"],
-            "lon": hazard["lon"],
-        }
+    for hazard in terrain_risks:
+        location = hazard["location"]
 
         closest = min(
             hazard_distance(location, a, b)
             for a, b in zip(points, points[1:])
         )
 
-        if closest <= hazard["radius"] + 2:
+        if closest <= 1.5 and hazard["id"] not in detected_ids:
+            detected_ids.add(hazard["id"])
             detected.append({
                 "id": hazard["id"],
                 "name": hazard["name"],
@@ -105,32 +146,42 @@ def find_hazards(points):
                 "severity": hazard["severity"],
                 "location": location,
                 "distance_from_route_km": round(closest, 2),
+                "slope_degrees": hazard["slope_degrees"],
+                "elevation_m": hazard["elevation_m"],
+                "recommendation": hazard["recommendation"],
             })
 
     return detected
 
 
 def get_terrain(points):
-    slope_layer = next(
-        layer for layer in terrain_layers
-        if layer["type"] == "slope"
-    )
-    elevation_layer = next(
-        layer for layer in terrain_layers
-        if layer["type"] == "elevation"
-    )
-
-    # Simulated values based on the shared layer ranges.
-    base_slope = (
-        slope_layer["min_value"] + slope_layer["max_value"]
-    ) / 5
-
+    cells = get_terrain_cells()
     segments = []
 
     for index, (a, b) in enumerate(zip(points, points[1:]), 1):
-        length = distance(a, b)
+        first_cell = get_nearest_terrain_cell(a, cells)
+        second_cell = get_nearest_terrain_cell(b, cells)
+
+        if (
+            first_cell is None
+            or second_cell is None
+            or first_cell["slope"] is None
+            or second_cell["slope"] is None
+            or first_cell["elevation"] is None
+            or second_cell["elevation"] is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Terrain data is unavailable for this route."
+            )
+
         slope = round(
-            min(slope_layer["max_value"], base_slope + length / 5),
+            (first_cell["slope"] + second_cell["slope"]) / 2,
+            2
+        )
+
+        elevation = round(
+            (first_cell["elevation"] + second_cell["elevation"]) / 2,
             2
         )
 
@@ -143,13 +194,18 @@ def get_terrain(points):
         segments.append({
             "segment": index,
             "slope": slope,
+            "elevation_m": elevation,
             "terrain_type": terrain_type,
         })
 
     average_slope = round(
-        sum(s["slope"] for s in segments) / len(segments),
-        2
+        sum(s["slope"] for s in segments) / len(segments), 2
     )
+
+    average_elevation = round(
+        sum(s["elevation_m"] for s in segments) / len(segments), 2
+    )
+
     maximum_slope = max(s["slope"] for s in segments)
 
     difficulty = (
@@ -158,20 +214,22 @@ def get_terrain(points):
         else "hard"
     )
 
+    terrain_type = (
+        "flat" if average_slope < 6
+        else "rocky" if average_slope < 15
+        else "uneven"
+    )
+
     return {
         "terrain_summary": {
-            "average_elevation": (
-                elevation_layer["min_value"]
-                + elevation_layer["max_value"]
-            ) / 2,
+            "average_elevation": average_elevation,
             "maximum_slope": maximum_slope,
             "average_slope": average_slope,
-            "terrain_type": "rocky",
+            "terrain_type": terrain_type,
             "difficulty": difficulty,
         },
         "segments": segments,
     }
-
 
 def analyze(points):
     detected = find_hazards(points)
@@ -179,10 +237,20 @@ def analyze(points):
 
     penalties = {"low": 8, "medium": 20, "high": 35}
 
-    score = 100 - sum(
-        penalties.get(h["severity"], 10)
-        for h in detected
-    )
+    if detected:
+        highest_penalty = max(
+            penalties.get(h["severity"], 10)
+            for h in detected
+        )
+
+        additional_penalties = min(
+            (len(detected) - 1) * 3,
+            15
+        )
+
+        score = 100 - highest_penalty - additional_penalties
+    else:
+        score = 100
 
     if terrain["difficulty"] == "moderate":
         score -= 10
@@ -198,9 +266,10 @@ def analyze(points):
     )
 
     warnings = [
-        f'{h["name"]}: {h["severity"]} severity near the route.'
-        for h in detected
-    ]
+    f'{h["name"]}: {h["severity"]} severity '
+    f'({h["slope_degrees"]}° slope) near the route.'
+    for h in detected
+]
 
     if terrain["difficulty"] == "hard":
         warnings.append("Difficult terrain detected.")
@@ -225,19 +294,22 @@ def analyze(points):
                 "name": h["name"],
                 "severity": h["severity"],
                 "distance_from_route_km": h["distance_from_route_km"],
+                "slope_degrees": h["slope_degrees"],
+                "elevation_m": h["elevation_m"],
             }
             for h in detected
         ],
         "terrain_analysis": {
             "average_slope": terrain["average_slope"],
+            "maximum_slope": terrain["maximum_slope"],
+            "average_elevation": terrain["average_elevation"],
             "terrain_type": terrain["terrain_type"],
             "difficulty": terrain["difficulty"],
         },
         "warnings": warnings,
         "recommendation": recommendation,
-        "data_source": "mock",
+        "data_source": TERRAIN_SOURCE,
     }
-
 
 def get_saved_route(route_id):
     if route_id not in saved_routes:
@@ -245,10 +317,10 @@ def get_saved_route(route_id):
             status_code=404,
             detail="Resource not found"
         )
+
     return saved_routes[route_id]
 
 
-# API 1: Create route
 @router.post("", status_code=201)
 def create_route(request: RouteInput):
     start = request.start.model_dump()
@@ -273,6 +345,7 @@ def create_route(request: RouteInput):
             "lat": max(-90, min(90, midpoint["lat"] + offset)),
             "lon": midpoint["lon"],
         }
+
         candidates.append([
             start,
             interpolate(start, via, 0.5),
@@ -307,14 +380,13 @@ def create_route(request: RouteInput):
         "distance_km": result["distance_km"],
         "estimated_duration_hours": result["estimated_duration_hours"],
         "status": status,
-        "data_source": "mock",
+        "data_source": TERRAIN_SOURCE,
     }
 
     saved_routes[route_id] = route
     return route
 
 
-# API 2: Get route
 @router.get("/{route_id}")
 def get_route(route_id: int):
     route = get_saved_route(route_id)
@@ -324,11 +396,11 @@ def get_route(route_id: int):
         **route,
         "safety_score": result["safety_score"],
         "risk_level": result["risk_level"],
-        "data_source": "mock",
+        "terrain_analysis": result["terrain_analysis"],
+        "data_source": TERRAIN_SOURCE,
     }
 
 
-# API 3: Analyze route safety
 @router.post("/analyze")
 def analyze_route(request: AnalysisInput):
     points = [p.model_dump() for p in request.waypoints]
@@ -346,7 +418,6 @@ def analyze_route(request: AnalysisInput):
     return analyze(points)
 
 
-# API 4: Get route hazards
 @router.get("/{route_id}/hazards")
 def get_route_hazards(route_id: int):
     route = get_saved_route(route_id)
@@ -356,11 +427,10 @@ def get_route_hazards(route_id: int):
         "route_id": route_id,
         "total_hazards": len(detected),
         "hazards": detected,
-        "data_source": "mock",
+        "data_source": TERRAIN_SOURCE,
     }
 
 
-# API 5: Get route terrain
 @router.get("/{route_id}/terrain")
 def get_route_terrain(route_id: int):
     route = get_saved_route(route_id)
@@ -368,11 +438,10 @@ def get_route_terrain(route_id: int):
     return {
         "route_id": route_id,
         **get_terrain(route["waypoints"]),
-        "data_source": "mock",
+        "data_source": TERRAIN_SOURCE,
     }
 
 
-# API 6: Delete route
 @router.delete("/{route_id}")
 def delete_route(route_id: int):
     get_saved_route(route_id)
