@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 .env
+
+# NASA downloaded datasets
+app/data/nasa/
