@@ -5,6 +5,12 @@ from math import radians, sin, cos, asin, sqrt
 from itertools import count
 from functools import lru_cache
 
+import heapq
+import numpy as np
+from rasterio.windows import Window
+from rasterio.enums import Resampling
+from app.data.hirise_reader import load_hirise_data, get_pixel_location
+
 from app.data.mock_data import routes
 from app.routes.mars import get_terrain_grid
 from app.routes.hazards import get_terrain_risks
@@ -329,38 +335,10 @@ def create_route(request: RouteInput):
     if start == destination:
         raise HTTPException(
             status_code=400,
-            detail="Invalid request parameters"
+            detail="Start and destination must be different."
         )
 
-    direct = [
-        interpolate(start, destination, i / 3)
-        for i in range(4)
-    ]
-
-    midpoint = interpolate(start, destination, 0.5)
-    candidates = [direct]
-
-    for offset in (-0.05, 0.05):
-        via = {
-            "lat": max(-90, min(90, midpoint["lat"] + offset)),
-            "lon": midpoint["lon"],
-        }
-
-        candidates.append([
-            start,
-            interpolate(start, via, 0.5),
-            via,
-            interpolate(via, destination, 0.5),
-            destination,
-        ])
-
-    points = max(
-        candidates,
-        key=lambda p: (
-            analyze(p)["safety_score"],
-            -total_distance(p)
-        )
-    )
+    points = astar_route(start, destination)
 
     result = analyze(points)
     route_id = next(next_id)
@@ -373,20 +351,291 @@ def create_route(request: RouteInput):
 
     route = {
         "id": route_id,
-        "name": f"Exploration Route {route_id}",
+        "name": f"A* Mars Exploration Route {route_id}",
         "start": start,
         "destination": destination,
         "waypoints": points,
         "distance_km": result["distance_km"],
         "estimated_duration_hours": result["estimated_duration_hours"],
         "status": status,
-        "data_source": TERRAIN_SOURCE,
+        "algorithm": "A*",
+        "data_source": "USGS/NASA HiRISE DTM",
     }
 
     saved_routes[route_id] = route
     return route
+def astar_route(start, destination):
+    dataset = load_hirise_data()
+
+    start_row, start_col = get_pixel_location(
+        dataset, start["lat"], start["lon"]
+    )
+    end_row, end_col = get_pixel_location(
+        dataset, destination["lat"], destination["lon"]
+    )
+
+    margin = 3000
+
+    row_min = max(0, min(start_row, end_row) - margin)
+    col_min = max(0, min(start_col, end_col) - margin)
+
+    row_max = min(dataset.height, max(start_row, end_row) + margin)
+    col_max = min(dataset.width, max(start_col, end_col) + margin)
+
+    height = row_max - row_min
+    width = col_max - col_min
+
+    grid_rows = max(2, int(np.ceil(height / 100)))
+    grid_cols = max(2, int(np.ceil(width / 100)))
+
+    window = Window(col_min, row_min, width, height)
+
+    elevation = dataset.read(
+        1,
+        window=window,
+        out_shape=(grid_rows, grid_cols),
+        resampling=Resampling.average
+    ).astype(float)
+
+    valid = np.isfinite(elevation)
+
+    if dataset.nodata is not None:
+        valid &= elevation != dataset.nodata
+
+    elevation[~valid] = np.nan
+
+    row_size = height / grid_rows
+    col_size = width / grid_cols
+
+    filled = elevation.copy()
+
+    for _ in range(5):
+        missing = ~np.isfinite(filled)
+
+        if not missing.any():
+            break
+
+        padded = np.pad(filled, 1, mode="edge")
+
+        neighbors = [
+            padded[:-2, 1:-1],
+            padded[2:, 1:-1],
+            padded[1:-1, :-2],
+            padded[1:-1, 2:],
+        ]
+
+        total = np.zeros_like(filled)
+        count = np.zeros_like(filled)
+
+        for neighbor in neighbors:
+            available = np.isfinite(neighbor)
+            total += np.where(available, neighbor, 0)
+            count += available
+
+        fillable = missing & (count > 0)
+        filled[fillable] = total[fillable] / count[fillable]
+
+    gradient_y, gradient_x = np.gradient(
+        filled, row_size, col_size
+    )
+
+    slopes = np.degrees(
+        np.arctan(np.sqrt(gradient_x ** 2 + gradient_y ** 2))
+    )
+
+    slopes[~valid] = np.inf
 
 
+
+    def grid_position(pixel_row, pixel_col):
+        row = round((pixel_row - row_min) / row_size)
+        col = round((pixel_col - col_min) / col_size)
+
+        return (
+            max(0, min(grid_rows - 1, row)),
+            max(0, min(grid_cols - 1, col))
+        )
+
+    start_node = grid_position(start_row, start_col)
+    end_node = grid_position(end_row, end_col)
+
+    def find_valid_node(node):
+        r, c = node
+
+        for radius in range(10):
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    nr, nc = r + dr, c + dc
+
+                    if (
+                        0 <= nr < grid_rows
+                        and 0 <= nc < grid_cols
+                        and valid[nr, nc]
+                    ):
+                        return nr, nc
+
+        raise HTTPException(
+            status_code=400,
+            detail="No valid HiRISE terrain near start or destination."
+        )
+
+    start_node = find_valid_node(start_node)
+    end_node = find_valid_node(end_node)
+
+    if start_node == end_node:
+        raise HTTPException(
+            status_code=400,
+            detail="Start and destination are too close."
+        )
+
+    hazards = get_terrain_risk_data()
+
+    def hazard_cost(row, col):
+        x = col_min + (col + 0.5) * col_size
+        y = row_min + (row + 0.5) * row_size
+        lon, lat = dataset.xy(y, x)
+
+        point = {
+            "lat": y * 0 + lat * 180 / 3396190 / 3.141592653589793,
+            "lon": lon * 180 / 3396190 / 3.141592653589793
+        }
+
+        penalty = 0
+
+        for hazard in hazards:
+            d = distance(point, hazard["location"])
+            severity = hazard["severity"].lower()
+
+            radius = {
+                "high": 0.25,
+                "medium": 0.15,
+                "low": 0.075
+            }.get(severity, 0.15)
+
+            if d < radius:
+                penalty += {
+                    "high": 100,
+                    "medium": 40,
+                    "low": 10
+                }.get(severity, 10)
+
+            elif d < 0.5:
+                penalty += {
+                    "high": 10,
+                    "medium": 5,
+                    "low": 2
+                }.get(severity, 2)
+
+        return penalty
+
+    def heuristic(a, b):
+        return (
+            np.hypot(a[0] - b[0], a[1] - b[1]) * 100
+        )
+
+    open_set = [(0, start_node)]
+    came_from = {}
+    g_score = {start_node: 0}
+    closed = set()
+
+    directions = [
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1)
+    ]
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+
+        if current in closed:
+            continue
+
+        if current == end_node:
+            path = [current]
+
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+
+            path.reverse()
+            break
+
+        closed.add(current)
+
+        for dr, dc in directions:
+            neighbor = (
+                current[0] + dr,
+                current[1] + dc
+            )
+
+            nr, nc = neighbor
+
+            if (
+                not 0 <= nr < grid_rows
+                or not 0 <= nc < grid_cols
+                or not valid[nr, nc]
+                or neighbor in closed
+            ):
+                continue
+
+            slope = slopes[nr, nc]
+
+            if slope > 45:
+                continue
+            
+            hazard_penalty = hazard_cost(nr, nc)
+            
+            movement = 100 * (
+                np.sqrt(2) if dr and dc else 1
+            )
+
+            elevation_change = max(
+                0,
+                elevation[nr, nc] - elevation[current]
+            )
+
+            cost = movement * (
+                1 + slope / 30
+                + elevation_change / 50
+                + hazard_penalty
+            )
+
+            tentative = g_score[current] + cost
+
+            if tentative < g_score.get(neighbor, float("inf")):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative
+
+                heapq.heappush(
+                    open_set,
+                    (
+                        tentative + heuristic(neighbor, end_node),
+                        neighbor
+                    )
+                )
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="A* could not find a safe path through the available terrain."
+        )
+
+    points = []
+
+    for row, col in path:
+        pixel_row = row_min + (row + 0.5) * row_size
+        pixel_col = col_min + (col + 0.5) * col_size
+
+        x, y = dataset.xy(pixel_row, pixel_col)
+
+        points.append({
+            "lat": y * 180 / 3396190 / 3.141592653589793,
+            "lon": x * 180 / 3396190 / 3.141592653589793
+        })
+
+    points[0] = start
+    points[-1] = destination
+
+    return points
 @router.get("/{route_id}")
 def get_route(route_id: int):
     route = get_saved_route(route_id)
