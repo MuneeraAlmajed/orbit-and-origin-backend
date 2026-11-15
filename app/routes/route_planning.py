@@ -585,7 +585,7 @@ def astar_route(start, destination):
 
             slope = slopes[nr, nc]
 
-            if slope > 45:
+            if slope > 60:
                 continue
             
             hazard_penalty = hazard_cost(nr, nc)
