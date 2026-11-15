@@ -3,6 +3,10 @@ from fastapi import APIRouter, HTTPException
 from app.data.mock_data import mars_map
 from app.data.mola_reader import get_elevation, get_slope
 from app.data.hirise_reader import get_hirise_elevation, get_hirise_slope
+import math
+import numpy as np
+from rasterio.enums import Resampling
+from app.data.hirise_reader import load_hirise_data
 
 router = APIRouter(prefix="/api/v1/mars", tags=["Mars Map"])
 
@@ -163,6 +167,64 @@ def get_terrain_grid():
         "total_cells": len(cells),
         "data": cells,
         "data_source": "NASA MOLA MEGDR and USGS/NASA HiRISE DTM"
+    }
+    
+@router.get("/terrain/3d")
+def get_3d_terrain():
+    dataset = load_hirise_data()
+
+    rows = 150
+    columns = 150
+
+    terrain = dataset.read(
+        1,
+        out_shape=(rows, columns),
+        resampling=Resampling.average,
+        masked=True
+    )
+
+    left, bottom, right, top = dataset.bounds
+
+    x_step = (right - left) / columns
+    y_step = (top - bottom) / rows
+
+    cells = []
+
+    for row in range(rows):
+        for col in range(columns):
+            value = terrain[row, col]
+
+            elevation = None
+
+            if not np.ma.is_masked(value):
+                if math.isfinite(float(value)):
+                    elevation = round(float(value), 2)
+
+            west = left + col * x_step
+            east = west + x_step
+            north = top - row * y_step
+            south = north - y_step
+
+            cells.append({
+                "elevation": elevation,
+                "bounds": [
+                    [
+                        math.degrees(south / 3396190),
+                        math.degrees(west / 3396190)
+                    ],
+                    [
+                        math.degrees(north / 3396190),
+                        math.degrees(east / 3396190)
+                    ]
+                ]
+            })
+
+    return {
+        "rows": rows,
+        "columns": columns,
+        "data": cells,
+        "data_source": "USGS/NASA HiRISE DTM",
+        "original_resolution_meters": 1
     }
 
 @router.get("/layers")

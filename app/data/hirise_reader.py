@@ -20,20 +20,28 @@ def load_hirise_data():
     return rasterio.open(HIRISE_FILE)
 
 
-def get_hirise_elevation(lat, lon):
-    dataset = load_hirise_data()
-
+def get_pixel_location(dataset, lat, lon):
     x = MARS_RADIUS * math.radians(lon)
     y = MARS_RADIUS * math.radians(lat)
 
-    left, bottom, right, top = dataset.bounds
+    row, col = dataset.index(x, y)
 
-    if not (left <= x <= right and bottom <= y <= top):
+    if row < 0 or col < 0:
         raise ValueError("Location is outside HiRISE data coverage")
 
-    value = next(dataset.sample([(x, y)]))[0]
+    if row >= dataset.height or col >= dataset.width:
+        raise ValueError("Location is outside HiRISE data coverage")
 
-    if value == dataset.nodata:
+    return row, col
+
+
+def get_hirise_elevation(lat, lon):
+    dataset = load_hirise_data()
+    row, col = get_pixel_location(dataset, lat, lon)
+
+    value = dataset.read(1, window=Window(col, row, 1, 1))[0, 0]
+
+    if not math.isfinite(float(value)) or value == dataset.nodata:
         raise ValueError("No elevation data available at this location")
 
     return round(float(value), 2)
@@ -41,11 +49,7 @@ def get_hirise_elevation(lat, lon):
 
 def get_hirise_slope(lat, lon):
     dataset = load_hirise_data()
-
-    x = MARS_RADIUS * math.radians(lon)
-    y = MARS_RADIUS * math.radians(lat)
-
-    row, col = dataset.index(x, y)
+    row, col = get_pixel_location(dataset, lat, lon)
 
     if row <= 0 or col <= 0:
         raise ValueError("Not enough neighboring HiRISE data")
@@ -56,24 +60,26 @@ def get_hirise_slope(lat, lon):
     window = Window(col - 1, row - 1, 3, 3)
     values = dataset.read(1, window=window)
 
-    north = float(values[0, 1])
-    south = float(values[2, 1])
-    east = float(values[1, 2])
-    west = float(values[1, 0])
-
-    neighbors = [north, south, east, west]
+    neighbors = [
+        values[0, 1],
+        values[2, 1],
+        values[1, 2],
+        values[1, 0]
+    ]
 
     if any(
-        not math.isfinite(value) or value == dataset.nodata
+        not math.isfinite(float(value)) or value == dataset.nodata
         for value in neighbors
     ):
         raise ValueError("Missing neighboring HiRISE elevation data")
 
-    dz_dx = (east - west) / 2
-    dz_dy = (south - north) / 2
+    pixel_width, pixel_height = dataset.res
+
+    dz_dx = (float(values[1, 2]) - float(values[1, 0])) / (2 * pixel_width)
+    dz_dy = (float(values[2, 1]) - float(values[0, 1])) / (2 * abs(pixel_height))
 
     slope = math.degrees(
-        math.atan(math.sqrt(dz_dx**2 + dz_dy**2))
+        math.atan(math.sqrt(dz_dx ** 2 + dz_dy ** 2))
     )
 
     return round(slope, 2)
