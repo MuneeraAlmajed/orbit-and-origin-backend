@@ -338,7 +338,10 @@ def create_route(request: RouteInput):
             detail="Start and destination must be different."
         )
 
-    points = astar_route(start, destination)
+    astar_result = astar_route(start, destination)
+
+    points = astar_result["waypoints"]
+    explored_cells = astar_result["explored_cells"]
 
     result = analyze(points)
     route_id = next(next_id)
@@ -355,6 +358,7 @@ def create_route(request: RouteInput):
         "start": start,
         "destination": destination,
         "waypoints": points,
+        "explored_cells": explored_cells,
         "distance_km": result["distance_km"],
         "estimated_duration_hours": result["estimated_duration_hours"],
         "status": status,
@@ -537,6 +541,7 @@ def astar_route(start, destination):
     came_from = {}
     g_score = {start_node: 0}
     closed = set()
+    explored = []
 
     directions = [
         (-1, 0), (1, 0), (0, -1), (0, 1),
@@ -560,6 +565,7 @@ def astar_route(start, destination):
             break
 
         closed.add(current)
+        explored.append(current)
 
         for dr, dc in directions:
             neighbor = (
@@ -618,6 +624,19 @@ def astar_route(start, destination):
             status_code=400,
             detail="A* could not find a safe path through the available terrain."
         )
+        
+    explored_points = []
+
+    for row, col in explored:
+        pixel_row = row_min + (row + 0.5) * row_size
+        pixel_col = col_min + (col + 0.5) * col_size
+
+        x, y = dataset.xy(pixel_row, pixel_col)
+
+        explored_points.append({
+            "lat": y * 180 / 3396190 / 3.141592653589793,
+            "lon": x * 180 / 3396190 / 3.141592653589793
+    })
 
     points = []
 
@@ -635,7 +654,10 @@ def astar_route(start, destination):
     points[0] = start
     points[-1] = destination
 
-    return points
+    return {
+    "waypoints": points,
+    "explored_cells": explored_points
+}
 @router.get("/{route_id}")
 def get_route(route_id: int):
     route = get_saved_route(route_id)
