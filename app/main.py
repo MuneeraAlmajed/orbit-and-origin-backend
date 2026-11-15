@@ -1,11 +1,12 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from app.routes.mars import router as mars_router
 from app.routes.hazards import router as hazards_router
 from app.routes.science_pois import router as science_pois_router
 from app.routes.route_planning import router as route_planning_router
 
 app = FastAPI(title="Orbit & Origin API")
+
+from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
