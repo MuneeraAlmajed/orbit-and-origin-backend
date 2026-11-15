@@ -1,7 +1,7 @@
-
 from pathlib import Path
 from functools import lru_cache
 from rasterio.windows import Window
+from rasterio.errors import RasterioIOError
 import math
 import rasterio
 
@@ -35,30 +35,49 @@ def get_pixel_location(dataset, lat, lon):
     return row, col
 
 
+def is_valid_elevation(value, nodata):
+    return (
+        math.isfinite(float(value))
+        and (nodata is None or value != nodata)
+    )
+
+
 def get_hirise_elevation(lat, lon):
     dataset = load_hirise_data()
-    row, col = get_pixel_location(dataset, lat, lon)
 
-    value = dataset.read(1, window=Window(col, row, 1, 1))[0, 0]
+    try:
+        row, col = get_pixel_location(dataset, lat, lon)
+        value = dataset.read(
+            1,
+            window=Window(col, row, 1, 1)
+        )[0, 0]
+    except (RasterioIOError, ValueError):
+        return None
 
-    if not math.isfinite(float(value)) or value == dataset.nodata:
-        raise ValueError("No elevation data available at this location")
+    if not is_valid_elevation(value, dataset.nodata):
+        return None
 
     return round(float(value), 2)
 
 
 def get_hirise_slope(lat, lon):
     dataset = load_hirise_data()
-    row, col = get_pixel_location(dataset, lat, lon)
 
-    if row <= 0 or col <= 0:
-        raise ValueError("Not enough neighboring HiRISE data")
+    try:
+        row, col = get_pixel_location(dataset, lat, lon)
 
-    if row >= dataset.height - 1 or col >= dataset.width - 1:
-        raise ValueError("Not enough neighboring HiRISE data")
+        if (
+            row <= 0 or col <= 0
+            or row >= dataset.height - 1
+            or col >= dataset.width - 1
+        ):
+            return None
 
-    window = Window(col - 1, row - 1, 3, 3)
-    values = dataset.read(1, window=window)
+        window = Window(col - 1, row - 1, 3, 3)
+        values = dataset.read(1, window=window)
+
+    except (RasterioIOError, ValueError):
+        return None
 
     neighbors = [
         values[0, 1],
@@ -67,16 +86,21 @@ def get_hirise_slope(lat, lon):
         values[1, 0]
     ]
 
-    if any(
-        not math.isfinite(float(value)) or value == dataset.nodata
+    if not all(
+        is_valid_elevation(value, dataset.nodata)
         for value in neighbors
     ):
-        raise ValueError("Missing neighboring HiRISE elevation data")
+        return None
 
     pixel_width, pixel_height = dataset.res
 
-    dz_dx = (float(values[1, 2]) - float(values[1, 0])) / (2 * pixel_width)
-    dz_dy = (float(values[2, 1]) - float(values[0, 1])) / (2 * abs(pixel_height))
+    dz_dx = (
+        float(values[1, 2]) - float(values[1, 0])
+    ) / (2 * pixel_width)
+
+    dz_dy = (
+        float(values[2, 1]) - float(values[0, 1])
+    ) / (2 * abs(pixel_height))
 
     slope = math.degrees(
         math.atan(math.sqrt(dz_dx ** 2 + dz_dy ** 2))
