@@ -9,7 +9,7 @@ HIRISE_FILE = (
     Path(__file__).parent
     / "nasa"
     / "hirise"
-    / "jezero_hirise_dtm.tif"
+    / "jezero_hirise_dtm_small.tif"
 )
 
 MARS_RADIUS = 3396190
